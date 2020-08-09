@@ -109,15 +109,77 @@ class TMCCurrentHelper:
         self.fields.set_field("IHOLD", ihold)
         self.fields.set_field("IRUN", irun)
         gcode = self.printer.lookup_object("gcode")
-        gcode.register_mux_command("SET_TMC_CURRENT", "STEPPER", self.name,
-                                   self.cmd_SET_TMC_CURRENT,
-                                   desc=self.cmd_SET_TMC_CURRENT_help)
-    def _calc_current_bits(self, current, vsense):
-        sense_resistor = self.sense_resistor + 0.020
-        vref = 0.32
-        if vsense:
-            vref = 0.18
-        cs = int(32. * current * sense_resistor * math.sqrt(2.) / vref
+        gcode.register_mux_command(
+            "DUMP_TMC", "STEPPER", self.name,
+            self.cmd_DUMP_TMC, desc=self.cmd_DUMP_TMC_help)
+        # Get config for initial driver settings
+        self.run_current = config.getfloat('run_current', above=0., maxval=2.)
+        self.hold_current = config.getfloat(
+            'hold_current', self.run_current, above=0., maxval=2.)
+        self.homing_current = config.getfloat(
+            'homing_current', self.run_current, above=0., maxval=2.)
+        self.sense_resistor = config.getfloat('sense_resistor', 0.110, above=0.)
+        steps = {'256': 0, '128': 1, '64': 2, '32': 3, '16': 4,
+                 '8': 5, '4': 6, '2': 7, '1': 8}
+        self.mres = config.getchoice('microsteps', steps)
+        interpolate = config.getboolean('interpolate', True)
+        sc_velocity = config.getfloat('stealthchop_threshold', 0., minval=0.)
+        sc_threshold = self.velocity_to_clock(config, sc_velocity)
+        self.iholddelay = config.getint(
+            'driver_IHOLDDELAY', 8, minval=0, maxval=15)
+        tpowerdown = config.getint('driver_TPOWERDOWN', 0, minval=0, maxval=255)
+        blank_time_select = config.getint('driver_BLANK_TIME_SELECT', 1,
+                                          minval=0, maxval=3)
+        toff = config.getint('driver_TOFF', 4, minval=1, maxval=15)
+        hend = config.getint('driver_HEND', 7, minval=0, maxval=15)
+        hstrt = config.getint('driver_HSTRT', 0, minval=0, maxval=7)
+        sgt = config.getint('driver_SGT', 0, minval=-64, maxval=63) & 0x7f
+        pwm_scale = config.getboolean('driver_PWM_AUTOSCALE', True)
+        pwm_freq = config.getint('driver_PWM_FREQ', 1, minval=0, maxval=3)
+        pwm_grad = config.getint('driver_PWM_GRAD', 4, minval=0, maxval=255)
+        pwm_ampl = config.getint('driver_PWM_AMPL', 128, minval=0, maxval=255)
+        # calculate current
+        self.vsense = config.getboolean('driver_VSENSE', None)
+        stealth_enable = config.getboolean('stealthchop_enable', False)
+        # Configure registers
+        self.reg_GCONF = stealth_enable << 2
+        self.reg_CHOP_CONF = (toff | (hstrt << 4) | (hend << 7) | 
+                              (blank_time_select << 15) | (self.mres << 24) |
+                              (interpolate << 28))
+        self.set_register("GCONF", self.reg_GCONF)
+        self.set_current_regs(self.run_current, self.hold_current)
+        self.set_register("TPOWERDOWN", tpowerdown)
+        self.set_register("TPWMTHRS", max(0, min(0xfffff, sc_threshold)))
+        self.set_register("COOLCONF", sgt << 16)
+        self.set_register("PWMCONF", (
+            pwm_ampl | (pwm_grad << 8) | (pwm_freq << 16) | (pwm_scale << 18)))
+        extras = tmc2130_extra.TMC2130_EXTRA(config, self)
+        self.printer_state = extras.printer_state
+    def set_current_regs(self, run_current, hold_current):
+        def get_bits(rc, hc, vs):
+            run = self.current_bits(rc, self.sense_resistor, vs)
+            hold = self.current_bits(hc, self.sense_resistor, vs)
+            return run, hold
+        if self.vsense is None:
+            # Auto Calculate Vsense
+            vsense = False
+            irun, ihold = get_bits(run_current, hold_current, vsense)
+            if irun < 16 and ihold < 16:
+                vsense = True
+                irun, ihold = get_bits(run_current, hold_current, vsense)
+        else:
+            vsense = self.vsense
+            irun, ihold = get_bits(run_current, hold_current, self.vsense)
+        chop_conf = self.reg_CHOP_CONF | (vsense << 17)
+        ihold_irun = ihold | (irun << 8) | (self.iholddelay << 16)
+        self.set_register("CHOPCONF", chop_conf)
+        self.set_register("IHOLD_IRUN", ihold_irun)
+    def current_bits(self, current, sense_resistor, vsense_on):
+        sense_resistor += 0.020
+        vsense = 0.32
+        if vsense_on:
+            vsense = 0.18
+        cs = int(32. * current * sense_resistor * math.sqrt(2.) / vsense
                  - 1. + .5)
         return max(0, min(31, cs))
     def _calc_current(self, run_current, hold_current):
@@ -199,6 +261,40 @@ class MCU_TMC_SPI:
         with self.mutex:
             self.spi.spi_send(data, minclock)
 
+# Endstop wrapper that enables tmc2130 "sensorless homing"
+class TMC2130VirtualEndstop:
+    def __init__(self, tmc2130):
+        self.tmc2130 = tmc2130
+        if tmc2130.diag1_pin is None:
+            raise pins.error("tmc2130 virtual endstop requires diag1_pin")
+        ppins = tmc2130.printer.lookup_object('pins')
+        self.mcu_endstop = ppins.setup_pin('endstop', tmc2130.diag1_pin)
+        if self.mcu_endstop.get_mcu() is not tmc2130.spi.get_mcu():
+            raise pins.error("tmc2130 virtual endstop must be on same mcu")
+        # Wrappers
+        self.get_mcu = self.mcu_endstop.get_mcu
+        self.add_stepper = self.mcu_endstop.add_stepper
+        self.get_steppers = self.mcu_endstop.get_steppers
+        self.home_start = self.mcu_endstop.home_start
+        self.home_wait = self.mcu_endstop.home_wait
+        self.query_endstop = self.mcu_endstop.query_endstop
+        self.query_endstop_wait = self.mcu_endstop.query_endstop_wait
+        self.TimeoutError = self.mcu_endstop.TimeoutError
+    def home_prepare(self):
+        gconf = self.tmc2130.reg_GCONF
+        gconf &= ~GCONF_EN_PWM_MODE
+        gconf |= GCONF_DIAG1_STALL
+        self.tmc2130.set_register("GCONF", gconf)
+        self.tmc2130.set_register("TCOOLTHRS", 0xfffff)
+        self.tmc2130.set_current_regs(
+            self.tmc2130.homing_current, self.tmc2130.hold_current)
+        self.mcu_endstop.home_prepare()
+    def home_finalize(self):
+        self.tmc2130.set_register("GCONF", self.tmc2130.reg_GCONF)
+        self.tmc2130.set_register("TCOOLTHRS", 0)
+        self.tmc2130.set_current_regs(
+            self.tmc2130.run_current, self.tmc2130.hold_current)
+        self.mcu_endstop.home_finalize()
 
 ######################################################################
 # TMC2130 printer object
